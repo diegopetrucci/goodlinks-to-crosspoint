@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goodlinks-to-crosspoint"
+version = "0.1.0"
+description = "Privacy-safe CLI foundation for GoodLinks to CrossPoint workflows"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Diego Petrucci" }]
+keywords = ["goodlinks", "crosspoint", "privacy"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = []
+
+[project.scripts]
+goodlinks-crosspoint = "goodlinks_crosspoint.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
