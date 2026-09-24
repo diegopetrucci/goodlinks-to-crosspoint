@@ -5,7 +5,8 @@ I really like tiny ereaders like the ones
 [GoodLinks, the read-later service](https://goodlinks.app).
 
 So I made this to take selected articles from my GoodLinks queue, convert them
-to ePubs, and send them to my tiny reader.
+to ePubs, and send them to my tiny reader. Sync supports CrossPoint on the
+Xteink X3, X4, and X4 Pro, with upload state tracked separately for each model.
 
 For the full command, state, device, recovery, and undo reference, see the
 [complete reference](docs/reference.md).
@@ -35,6 +36,17 @@ If you use `pass` as a secrets manager:
 
 1. Save the GoodLinks token: `pass insert goodlinks-crosspoint/goodlinks-token`
 2. Start the sync: `./sync.sh`.
+
+If `export.manifest.json` was created by an older version of this project,
+identify the reader that received those earlier uploads once. For example, if
+that reader was an X3, use `./sync.sh --legacy-device x3` for the first sync.
+Later X3 and X4 Pro syncs can both use the ordinary `./sync.sh` command; the
+connected model is detected automatically.
+
+Uploads go to the reader's root directory by default, so articles appear
+without opening an extra folder. An X3 manifest created with the older
+`/GoodLinks` default will upload the selected articles to root once; the CLI
+does not delete the older folder copies.
 
 If you don't use `pass`:
 

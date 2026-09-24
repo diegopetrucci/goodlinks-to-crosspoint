@@ -33,6 +33,12 @@ from .orchestration import (
     WorkflowResult,
 )
 
+_DEVICE_MODEL_IDENTITIES = {
+    "x3": "X3",
+    "x4": "X4",
+    "x4pro": "xteink_x4_pro",
+}
+
 
 class _ArgumentParser(argparse.ArgumentParser):
     """Keep invalid arguments from being echoed into command output."""
@@ -111,6 +117,24 @@ def _add_sync_device_options(parser: argparse.ArgumentParser) -> None:
         type=float,
         metavar="SECONDS",
         help="CrossPoint request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--device-model",
+        choices=tuple(_DEVICE_MODEL_IDENTITIES),
+        metavar="MODEL",
+        help=(
+            "Expected target model (x3, x4, or x4pro); required only for "
+            "device-specific dry-run planning and checked during a real sync."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-device",
+        choices=tuple(_DEVICE_MODEL_IDENTITIES),
+        metavar="MODEL",
+        help=(
+            "One-time owner of upload state from a version 1 manifest "
+            "(x3, x4, or x4pro)."
+        ),
     )
 
 
@@ -259,6 +283,16 @@ def _run_sync(args: argparse.Namespace) -> int:
         force=args.force,
         dry_run=args.dry_run,
         crosspoint=device,
+        device_identity=(
+            _DEVICE_MODEL_IDENTITIES[args.device_model]
+            if args.device_model is not None
+            else None
+        ),
+        legacy_device_identity=(
+            _DEVICE_MODEL_IDENTITIES[args.legacy_device]
+            if args.legacy_device is not None
+            else None
+        ),
     )
     result = orchestrator.run_sync()
     _print_result(result)

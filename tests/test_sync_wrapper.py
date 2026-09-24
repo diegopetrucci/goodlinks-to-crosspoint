@@ -171,6 +171,10 @@ class SyncWrapperFixture(unittest.TestCase):
     def test_forwards_flags_and_scopes_pass_token_to_child(self) -> None:
         result = self.run_wrapper(
             "--dry-run",
+            "--device-model",
+            "x4pro",
+            "--legacy-device",
+            "x3",
             "--api-url",
             "http://127.0.0.1:9/api/v1",
             "--pandoc-executable",
@@ -186,6 +190,10 @@ class SyncWrapperFixture(unittest.TestCase):
                 "goodlinks_crosspoint",
                 "sync",
                 "--dry-run",
+                "--device-model",
+                "x4pro",
+                "--legacy-device",
+                "x3",
                 "--api-url",
                 "http://127.0.0.1:9/api/v1",
                 "--pandoc-executable",

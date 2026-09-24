@@ -401,6 +401,23 @@ class CliWorkflowTests(unittest.TestCase):
         self.assertEqual(CliDeviceHandler.requests, [])
         self.assert_redacted(result)
 
+    def test_sync_rejects_an_expected_device_model_mismatch(self) -> None:
+        result = self.run_cli(
+            "sync",
+            *self.source_args(),
+            "--device-url",
+            self.device_url,
+            "--device-model",
+            "x4pro",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("device_identity_mismatch", result.stderr)
+        self.assertEqual(CliDeviceHandler.uploads, [])
+        self.assertFalse(self.output.exists())
+        self.assertFalse(Path(f"{self.output}.manifest.json").exists())
+        self.assert_redacted(result)
+
     def test_send_uploads_one_existing_epub_without_goodlinks(self) -> None:
         source = self.root / "existing.epub"
         source.write_bytes(b"synthetic-existing-epub")
@@ -455,7 +472,11 @@ class CliWorkflowTests(unittest.TestCase):
         self.assertIn("uploaded=1", first.stdout)
         self.assertIn("upload_skipped=1", second.stdout)
         self.assertEqual(len(CliDeviceHandler.uploads), 1)
-        self.assertEqual(len(CliDeviceHandler.requests), device_requests_after_first)
+        # A repeated sync still verifies which physical model is connected
+        # before consulting that model's upload-completion state.
+        self.assertEqual(
+            len(CliDeviceHandler.requests), device_requests_after_first + 1
+        )
         self.assertTrue(list(self.output.glob("*.epub")))
         self.assert_redacted(first)
         self.assert_redacted(second)

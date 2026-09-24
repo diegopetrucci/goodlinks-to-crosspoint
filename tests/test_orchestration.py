@@ -23,9 +23,11 @@ from goodlinks_crosspoint.api import (
     FetchedArticle,
     GoodLinksClient,
 )
-from goodlinks_crosspoint.crosspoint import CrossPointClient
+from goodlinks_crosspoint.crosspoint import CrossPointClient, CrossPointStatus
 from goodlinks_crosspoint.epub import safe_epub_filename
 from goodlinks_crosspoint.orchestration import (
+    DeviceIdentityMismatchError,
+    LegacyManifestDeviceRequiredError,
     ManifestLockError,
     Orchestrator,
     WorkflowInputError,
@@ -164,9 +166,15 @@ class FakeGoodLinks:
 
 
 class FakeCrossPoint:
-    def __init__(self) -> None:
+    def __init__(self, device_identity: str = "X3") -> None:
         self.uploads: list[tuple[Path, str, bool]] = []
         self.fail_uploads = 0
+        self.device_identity = device_identity
+        self.status_checks = 0
+
+    def get_status(self) -> CrossPointStatus:
+        self.status_checks += 1
+        return CrossPointStatus(device=self.device_identity)
 
     def upload_epub(
         self,
@@ -179,6 +187,8 @@ class FakeCrossPoint:
         if self.fail_uploads:
             self.fail_uploads -= 1
             raise RuntimeError()
+        if remote_directory == "/":
+            return f"/{path.name}"
         return f"{remote_directory}/{path.name}"
 
 
@@ -293,7 +303,7 @@ class OrchestrationTests(TestCase):
             manifest = json.loads(manifest_path(output).read_text(encoding="utf-8"))
             entry = manifest["articles"]["one"]
             self.assertTrue(entry["generated"])
-            self.assertTrue(entry["uploaded"])
+            self.assertTrue(entry["uploads"]["X3"]["uploaded"])
             self.assertEqual(set(entry), {
                 "id",
                 "content_hash",
@@ -301,8 +311,7 @@ class OrchestrationTests(TestCase):
                 "filename",
                 "output_hash",
                 "generated",
-                "uploaded",
-                "remote_path",
+                "uploads",
             })
             manifest_text = manifest_path(output).read_text(encoding="utf-8")
             self.assertNotIn("synthetic body", manifest_text)
@@ -357,6 +366,152 @@ class OrchestrationTests(TestCase):
                 FakeGoodLinks([changed_html]), output, pandoc_executable=fake
             ).run_export()
             self.assertEqual(regenerated.generated, 1)
+
+    def test_sync_tracks_x3_and_x4_pro_uploads_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = self.fake_pandoc(root)
+            output = root / "output"
+            goodlinks = FakeGoodLinks([self.article("one")])
+            x3 = FakeCrossPoint("X3")
+            x4_pro = FakeCrossPoint("xteink_x4_pro")
+
+            first_x3 = Orchestrator(
+                goodlinks, output, pandoc_executable=fake, crosspoint=x3
+            ).run_sync()
+            first_x4_pro = Orchestrator(
+                goodlinks, output, pandoc_executable=fake, crosspoint=x4_pro
+            ).run_sync()
+            repeated_x3 = Orchestrator(
+                goodlinks, output, pandoc_executable=fake, crosspoint=x3
+            ).run_sync()
+
+            self.assertEqual(first_x3.uploaded, 1)
+            self.assertEqual(first_x4_pro.generation_skipped, 1)
+            self.assertEqual(first_x4_pro.uploaded, 1)
+            self.assertEqual(repeated_x3.upload_skipped, 1)
+            self.assertEqual(len(x3.uploads), 1)
+            self.assertEqual(len(x4_pro.uploads), 1)
+
+            entry = json.loads(
+                manifest_path(output).read_text(encoding="utf-8")
+            )["articles"]["one"]
+            self.assertEqual(
+                set(entry["uploads"]), {"X3", "xteink_x4_pro"}
+            )
+            self.assertTrue(entry["uploads"]["X3"]["uploaded"])
+            self.assertTrue(
+                entry["uploads"]["xteink_x4_pro"]["uploaded"]
+            )
+
+    def test_dry_run_uses_only_an_explicit_models_upload_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = self.fake_pandoc(root)
+            output = root / "output"
+            goodlinks = FakeGoodLinks([self.article("one")])
+            Orchestrator(
+                goodlinks,
+                output,
+                pandoc_executable=fake,
+                crosspoint=FakeCrossPoint("xteink_x4_pro"),
+            ).run_sync()
+
+            unused_device = FakeCrossPoint("X3")
+            x4_pro_plan = Orchestrator(
+                goodlinks,
+                output,
+                pandoc_executable=fake,
+                crosspoint=unused_device,
+                device_identity="xteink_x4_pro",
+                dry_run=True,
+            ).run_sync()
+            conservative_plan = Orchestrator(
+                goodlinks,
+                output,
+                pandoc_executable=fake,
+                crosspoint=unused_device,
+                dry_run=True,
+            ).run_sync()
+
+            self.assertEqual(x4_pro_plan.upload_skipped, 1)
+            self.assertEqual(x4_pro_plan.planned_upload, 0)
+            self.assertEqual(conservative_plan.upload_skipped, 0)
+            self.assertEqual(conservative_plan.planned_upload, 1)
+            self.assertEqual(unused_device.status_checks, 0)
+            self.assertEqual(unused_device.uploads, [])
+
+    def test_version_one_upload_state_requires_explicit_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = self.fake_pandoc(root)
+            output = root / "output"
+            goodlinks = FakeGoodLinks([self.article("one")])
+            x3 = FakeCrossPoint("X3")
+            Orchestrator(
+                goodlinks, output, pandoc_executable=fake, crosspoint=x3
+            ).run_sync()
+
+            current = json.loads(
+                manifest_path(output).read_text(encoding="utf-8")
+            )
+            current_entry = current["articles"]["one"]
+            legacy_entry = {
+                key: value
+                for key, value in current_entry.items()
+                if key != "uploads"
+            }
+            legacy_entry.update(current_entry["uploads"]["X3"])
+            manifest_path(output).write_text(
+                json.dumps(
+                    {"version": 1, "articles": {"one": legacy_entry}}
+                ),
+                encoding="utf-8",
+            )
+            legacy_text = manifest_path(output).read_text(encoding="utf-8")
+
+            x4_pro = FakeCrossPoint("xteink_x4_pro")
+            with self.assertRaises(LegacyManifestDeviceRequiredError):
+                Orchestrator(
+                    goodlinks,
+                    output,
+                    pandoc_executable=fake,
+                    crosspoint=x4_pro,
+                ).run_sync()
+            self.assertEqual(
+                manifest_path(output).read_text(encoding="utf-8"), legacy_text
+            )
+
+            migrated = Orchestrator(
+                goodlinks,
+                output,
+                pandoc_executable=fake,
+                crosspoint=x4_pro,
+                legacy_device_identity="X3",
+            ).run_sync()
+
+            self.assertEqual(migrated.generation_skipped, 1)
+            self.assertEqual(migrated.uploaded, 1)
+            payload = json.loads(
+                manifest_path(output).read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["version"], 2)
+            self.assertEqual(
+                set(payload["articles"]["one"]["uploads"]),
+                {"X3", "xteink_x4_pro"},
+            )
+
+    def test_expected_device_identity_must_match_connected_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaises(DeviceIdentityMismatchError):
+                Orchestrator(
+                    FakeGoodLinks([self.article("one")]),
+                    root / "output",
+                    pandoc_executable=self.fake_pandoc(root),
+                    crosspoint=FakeCrossPoint("xteink_x4_pro"),
+                    device_identity="X3",
+                ).run_sync()
 
     def test_fetch_failure_leaves_existing_manifest_entry_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -435,8 +590,8 @@ class OrchestrationTests(TestCase):
                 foreign_manifest = json.loads(
                     manifest_path(foreign_output).read_text(encoding="utf-8")
                 )
-                self.assertNotIn(
-                    "owned_remote_path", foreign_manifest["articles"]["one"]
+                self.assertEqual(
+                    foreign_manifest["articles"]["one"]["uploads"], {}
                 )
         finally:
             device_server.shutdown()
@@ -468,13 +623,15 @@ class OrchestrationTests(TestCase):
             pending = json.loads(manifest_path(output).read_text(encoding="utf-8"))[
                 "articles"
             ]["one"]
+            pending_upload = pending["uploads"]["X3"]
             self.assertEqual(failed.failed, 1)
             self.assertFalse(pending["generated"])
-            self.assertFalse(pending["uploaded"])
+            self.assertFalse(pending_upload["uploaded"])
             self.assertEqual(
-                pending["owned_remote_path"], f"/GoodLinks/{pending['filename']}"
+                pending_upload["owned_remote_path"],
+                f"/{pending['filename']}",
             )
-            self.assertNotIn("remote_path", pending)
+            self.assertNotIn("remote_path", pending_upload)
 
             goodlinks.articles[0] = self.article("one", "recovered body")
             retried = Orchestrator(
@@ -489,8 +646,12 @@ class OrchestrationTests(TestCase):
             complete = json.loads(manifest_path(output).read_text(encoding="utf-8"))[
                 "articles"
             ]["one"]
-            self.assertNotIn("owned_remote_path", complete)
-            self.assertEqual(complete["remote_path"], f"/GoodLinks/{complete['filename']}")
+            complete_upload = complete["uploads"]["X3"]
+            self.assertNotIn("owned_remote_path", complete_upload)
+            self.assertEqual(
+                complete_upload["remote_path"],
+                f"/{complete['filename']}",
+            )
 
     def test_changed_content_upload_failure_can_retry_owned_remote(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -517,14 +678,16 @@ class OrchestrationTests(TestCase):
             pending = json.loads(manifest_path(output).read_text(encoding="utf-8"))[
                 "articles"
             ]["one"]
+            pending_upload = pending["uploads"]["X3"]
             self.assertEqual(failed.generated, 1)
             self.assertEqual(failed.uploaded, 0)
             self.assertTrue(pending["generated"])
-            self.assertFalse(pending["uploaded"])
+            self.assertFalse(pending_upload["uploaded"])
             self.assertEqual(
-                pending["owned_remote_path"], f"/GoodLinks/{pending['filename']}"
+                pending_upload["owned_remote_path"],
+                f"/{pending['filename']}",
             )
-            self.assertNotIn("remote_path", pending)
+            self.assertNotIn("remote_path", pending_upload)
 
             retried = Orchestrator(
                 goodlinks,
@@ -538,8 +701,9 @@ class OrchestrationTests(TestCase):
             complete = json.loads(manifest_path(output).read_text(encoding="utf-8"))[
                 "articles"
             ]["one"]
-            self.assertNotIn("owned_remote_path", complete)
-            self.assertTrue(complete["uploaded"])
+            complete_upload = complete["uploads"]["X3"]
+            self.assertNotIn("owned_remote_path", complete_upload)
+            self.assertTrue(complete_upload["uploaded"])
 
     def test_changed_destination_upload_failure_preserves_owned_path_for_retry(
         self,
@@ -570,17 +734,20 @@ class OrchestrationTests(TestCase):
             pending = json.loads(manifest_path(output).read_text(encoding="utf-8"))[
                 "articles"
             ]["one"]
+            pending_upload = pending["uploads"]["X3"]
             self.assertEqual(failed.failed, 1)
             self.assertEqual(failed.generated, 0)
-            self.assertFalse(pending["uploaded"])
-            self.assertEqual(pending["owned_remote_path"], f"/GoodLinks/{filename}")
-            self.assertNotIn("remote_path", pending)
+            self.assertFalse(pending_upload["uploaded"])
+            self.assertEqual(
+                pending_upload["owned_remote_path"], f"/{filename}"
+            )
+            self.assertNotIn("remote_path", pending_upload)
 
             retried = Orchestrator(
                 goodlinks,
                 output,
                 pandoc_executable=fake,
-                remote_directory="/GoodLinks",
+                remote_directory="/",
                 crosspoint=device,
             ).run_sync()
             self.assertEqual(retried.failed, 0)
@@ -589,8 +756,11 @@ class OrchestrationTests(TestCase):
             complete = json.loads(manifest_path(output).read_text(encoding="utf-8"))[
                 "articles"
             ]["one"]
-            self.assertEqual(complete["remote_path"], f"/GoodLinks/{filename}")
-            self.assertNotIn("owned_remote_path", complete)
+            complete_upload = complete["uploads"]["X3"]
+            self.assertEqual(
+                complete_upload["remote_path"], f"/{filename}"
+            )
+            self.assertNotIn("owned_remote_path", complete_upload)
 
     def test_deleted_owned_epub_regenerates_and_overwrites_remote(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -620,7 +790,7 @@ class OrchestrationTests(TestCase):
             complete = json.loads(manifest_path(output).read_text(encoding="utf-8"))[
                 "articles"
             ]["one"]
-            self.assertNotIn("owned_remote_path", complete)
+            self.assertNotIn("owned_remote_path", complete["uploads"]["X3"])
 
     def test_pandoc_timeout_is_validated_before_any_pandoc_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, self.assertRaises(
@@ -678,7 +848,7 @@ class OrchestrationTests(TestCase):
             manifest = json.loads(manifest_path(output).read_text(encoding="utf-8"))
             self.assertTrue(manifest["articles"]["one"]["generated"])
             self.assertFalse(manifest["articles"]["two"]["generated"])
-            self.assertFalse(manifest["articles"]["two"]["uploaded"])
+            self.assertEqual(manifest["articles"]["two"]["uploads"], {})
             self.assertNotIn("synthetic-failure-marker", manifest_path(output).read_text())
 
     def test_end_to_end_uses_only_synthetic_servers_and_fake_pandoc(self) -> None:

@@ -30,6 +30,7 @@ from typing import Any, Self
 from .api import DEFAULT_DELIVERY_TAG, FetchedArticle, GoodLinksError
 from .crosspoint import (
     DEFAULT_REMOTE_DIRECTORY,
+    SUPPORTED_DEVICE_IDENTITIES,
     CrossPointClient,
     normalize_remote_path,
 )
@@ -42,7 +43,7 @@ from .epub import (
 )
 
 DEFAULT_OUTPUT_DIRECTORY = "export"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _HASH_LENGTH = hashlib.sha256().digest_size * 2
 _CONTENT_ALGORITHM = "goodlinks-crosspoint-content-v1"
@@ -50,6 +51,8 @@ _CONFIG_ALGORITHM = "goodlinks-crosspoint-epub-config-v1"
 _FILENAME_ALGORITHM = "title-id-sha256-12-v1"
 _MAX_ERROR_CODE_LENGTH = 64
 _CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
+_LEGACY_MANIFEST_VERSION = 1
+_UNASSIGNED_LEGACY_DEVICE = "_legacy_v1"
 
 
 class WorkflowError(Exception):
@@ -73,6 +76,21 @@ class ManifestError(WorkflowError):
 class WorkflowInputError(WorkflowError):
     code = "workflow_input_error"
     default_message = "The workflow input is invalid."
+
+
+class LegacyManifestDeviceRequiredError(WorkflowError):
+    code = "legacy_manifest_device_required"
+    default_message = (
+        "The version 1 manifest has unassigned upload state; rerun once with "
+        "--legacy-device set to the reader that received those uploads."
+    )
+
+
+class DeviceIdentityMismatchError(WorkflowError):
+    code = "device_identity_mismatch"
+    default_message = (
+        "The connected CrossPoint device does not match --device-model."
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,10 +332,69 @@ def _valid_remote_path(value: Any) -> bool:
         return False
 
 
-def _read_manifest(path: Path) -> dict[str, dict[str, Any]]:
+def _validate_generation_entry(
+    key: Any, raw_entry: Any, *, allowed_fields: set[str]
+) -> dict[str, Any]:
+    if not isinstance(key, str) or not key or not isinstance(raw_entry, dict):
+        raise ManifestError()
+    if set(raw_entry) - allowed_fields:
+        raise ManifestError()
+    article_id = raw_entry.get("id")
+    if article_id != key or not isinstance(article_id, str) or not article_id:
+        raise ManifestError()
+    generated = raw_entry.get("generated")
+    if type(generated) is not bool:
+        raise ManifestError()
+    for field_name in ("content_hash", "config_hash", "output_hash"):
+        if field_name in raw_entry and not _is_hash(raw_entry[field_name]):
+            raise ManifestError()
+    if "filename" in raw_entry and not _valid_manifest_filename(
+        raw_entry["filename"]
+    ):
+        raise ManifestError()
+    if generated and not all(
+        field_name in raw_entry
+        for field_name in (
+            "content_hash",
+            "config_hash",
+            "filename",
+            "output_hash",
+        )
+    ):
+        raise ManifestError()
+    return dict(raw_entry)
+
+
+def _validate_upload_state(raw_state: Any, *, generated: bool) -> dict[str, Any]:
+    if not isinstance(raw_state, dict) or set(raw_state) - {
+        "uploaded",
+        "remote_path",
+        "owned_remote_path",
+    }:
+        raise ManifestError()
+    uploaded = raw_state.get("uploaded")
+    if type(uploaded) is not bool or (uploaded and not generated):
+        raise ManifestError()
+    if "remote_path" in raw_state and not _valid_remote_path(
+        raw_state["remote_path"]
+    ):
+        raise ManifestError()
+    if "owned_remote_path" in raw_state:
+        if not _valid_remote_path(raw_state["owned_remote_path"]):
+            raise ManifestError()
+        if uploaded or "remote_path" in raw_state:
+            raise ManifestError()
+    if uploaded and "remote_path" not in raw_state:
+        raise ManifestError()
+    if not uploaded and "remote_path" in raw_state:
+        raise ManifestError()
+    return dict(raw_state)
+
+
+def _read_manifest(path: Path) -> tuple[dict[str, dict[str, Any]], bool]:
     try:
         if not path.exists():
-            return {}
+            return {}, False
         if path.is_symlink() or not path.is_file():
             raise ManifestError()
         if path.stat().st_size > MAX_MANIFEST_BYTES:
@@ -334,74 +411,79 @@ def _read_manifest(path: Path) -> dict[str, dict[str, Any]]:
         payload = json.loads(payload_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ManifestError() from None
-    if not isinstance(payload, dict) or payload.get("version") != MANIFEST_VERSION:
+    if not isinstance(payload, dict) or payload.get("version") not in {
+        _LEGACY_MANIFEST_VERSION,
+        MANIFEST_VERSION,
+    }:
         raise ManifestError()
     articles = payload.get("articles")
     if not isinstance(articles, dict):
         raise ManifestError()
 
     result: dict[str, dict[str, Any]] = {}
-    allowed_fields = {
+    generation_fields = {
         "id",
         "content_hash",
         "config_hash",
         "filename",
         "output_hash",
         "generated",
-        "uploaded",
-        "remote_path",
-        "owned_remote_path",
     }
-    for key, raw_entry in articles.items():
-        if not isinstance(key, str) or not key or not isinstance(raw_entry, dict):
-            raise ManifestError()
-        if set(raw_entry) - allowed_fields:
-            # Reject and do not round-trip unknown fields; this prevents a
-            # previously contaminated manifest from being preserved.
-            raise ManifestError()
-        article_id = raw_entry.get("id")
-        if article_id != key or not isinstance(article_id, str) or not article_id:
-            raise ManifestError()
-        generated = raw_entry.get("generated")
-        uploaded = raw_entry.get("uploaded")
-        if type(generated) is not bool or type(uploaded) is not bool:
-            raise ManifestError()
-        if uploaded and not generated:
-            raise ManifestError()
-        for field_name in ("content_hash", "config_hash", "output_hash"):
-            if field_name in raw_entry and not _is_hash(raw_entry[field_name]):
-                raise ManifestError()
-        if "filename" in raw_entry and not _valid_manifest_filename(
-            raw_entry["filename"]
-        ):
-            raise ManifestError()
-        if "remote_path" in raw_entry and not _valid_remote_path(
-            raw_entry["remote_path"]
-        ):
-            raise ManifestError()
-        if "owned_remote_path" in raw_entry:
-            if not _valid_remote_path(raw_entry["owned_remote_path"]):
-                raise ManifestError()
-            # The durable ownership marker is only valid on an incomplete
-            # entry, before a successful upload restores remote_path.
-            if uploaded or "remote_path" in raw_entry:
-                raise ManifestError()
-        if generated and not all(
-            field_name in raw_entry
-            for field_name in (
-                "content_hash",
-                "config_hash",
-                "filename",
-                "output_hash",
+    if payload["version"] == _LEGACY_MANIFEST_VERSION:
+        legacy_fields = generation_fields | {
+            "uploaded",
+            "remote_path",
+            "owned_remote_path",
+        }
+        for key, raw_entry in articles.items():
+            entry = _validate_generation_entry(
+                key, raw_entry, allowed_fields=legacy_fields
             )
-        ):
+            uploaded = raw_entry.get("uploaded")
+            if type(uploaded) is not bool:
+                raise ManifestError()
+            legacy_state = _validate_upload_state(
+                {
+                    field_name: raw_entry[field_name]
+                    for field_name in (
+                        "uploaded",
+                        "remote_path",
+                        "owned_remote_path",
+                    )
+                    if field_name in raw_entry
+                },
+                generated=bool(raw_entry.get("generated")),
+            )
+            for field_name in ("uploaded", "remote_path", "owned_remote_path"):
+                entry.pop(field_name, None)
+            entry["uploads"] = (
+                {_UNASSIGNED_LEGACY_DEVICE: legacy_state}
+                if uploaded or "owned_remote_path" in legacy_state
+                else {}
+            )
+            result[key] = entry
+        return result, True
+
+    allowed_fields = generation_fields | {"uploads"}
+    for key, raw_entry in articles.items():
+        entry = _validate_generation_entry(
+            key, raw_entry, allowed_fields=allowed_fields
+        )
+        uploads = raw_entry.get("uploads")
+        if not isinstance(uploads, dict):
             raise ManifestError()
-        if uploaded and "remote_path" not in raw_entry:
-            raise ManifestError()
-        if not uploaded and "remote_path" in raw_entry:
-            raise ManifestError()
-        result[article_id] = dict(raw_entry)
-    return result
+        validated_uploads: dict[str, dict[str, Any]] = {}
+        for device_identity, raw_state in uploads.items():
+            if device_identity not in (
+                SUPPORTED_DEVICE_IDENTITIES | {_UNASSIGNED_LEGACY_DEVICE}
+            ):
+                raise ManifestError()
+            validated_uploads[device_identity] = _validate_upload_state(
+                raw_state, generated=bool(entry.get("generated"))
+            )
+        entry["uploads"] = validated_uploads
+        result[key] = entry
+    return result, False
 
 
 def _manifest_payload(articles: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
@@ -419,9 +501,7 @@ def _manifest_payload(articles: Mapping[str, Mapping[str, Any]]) -> dict[str, An
                     "filename",
                     "output_hash",
                     "generated",
-                    "uploaded",
-                    "remote_path",
-                    "owned_remote_path",
+                    "uploads",
                 )
                 if key in entry
             }
@@ -533,12 +613,41 @@ def _validate_pandoc_timeout(timeout: Any) -> float:
 class _Manifest:
     """Mutable, validated state held for one workflow invocation."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self, path: Path, *, legacy_device_identity: str | None = None
+    ) -> None:
         self.path = path
-        self.articles = _read_manifest(path)
+        self.articles, self.needs_save = _read_manifest(path)
+        if legacy_device_identity is not None:
+            self.assign_legacy_device(legacy_device_identity)
+
+    @property
+    def has_unassigned_legacy(self) -> bool:
+        return any(
+            _UNASSIGNED_LEGACY_DEVICE in entry.get("uploads", {})
+            for entry in self.articles.values()
+        )
+
+    def assign_legacy_device(self, device_identity: str) -> None:
+        if device_identity not in SUPPORTED_DEVICE_IDENTITIES:
+            raise WorkflowInputError()
+        changed = False
+        for entry in self.articles.values():
+            uploads = entry.get("uploads", {})
+            legacy_state = uploads.pop(_UNASSIGNED_LEGACY_DEVICE, None)
+            if legacy_state is None:
+                continue
+            existing = uploads.get(device_identity)
+            if existing is not None and existing != legacy_state:
+                raise ManifestError()
+            uploads[device_identity] = legacy_state
+            changed = True
+        if changed:
+            self.needs_save = True
 
     def save(self) -> None:
         _write_manifest(self.path, self.articles)
+        self.needs_save = False
 
 
 class Orchestrator:
@@ -556,6 +665,8 @@ class Orchestrator:
         force: bool = False,
         dry_run: bool = False,
         crosspoint: CrossPointClient | None = None,
+        device_identity: str | None = None,
+        legacy_device_identity: str | None = None,
     ) -> None:
         if not callable(getattr(goodlinks, "list_articles", None)) or not callable(
             getattr(goodlinks, "fetch_article", None)
@@ -571,6 +682,9 @@ class Orchestrator:
         pandoc_timeout = _validate_pandoc_timeout(pandoc_timeout)
         if type(force) is not bool or type(dry_run) is not bool:
             raise WorkflowInputError()
+        for identity in (device_identity, legacy_device_identity):
+            if identity is not None and identity not in SUPPORTED_DEVICE_IDENTITIES:
+                raise WorkflowInputError()
         if not isinstance(tag, str) or not tag.strip():
             raise WorkflowInputError()
         try:
@@ -586,6 +700,8 @@ class Orchestrator:
         self.force = force
         self.dry_run = dry_run
         self.crosspoint = crosspoint
+        self.device_identity = device_identity
+        self.legacy_device_identity = legacy_device_identity
         self._exporter: PandocEpubExporter | None = None
 
     def _exporter_for_run(self) -> PandocEpubExporter:
@@ -600,6 +716,16 @@ class Orchestrator:
             raise WorkflowInputError()
         return self.crosspoint
 
+    def _target_device_identity(self, *, sync: bool) -> str | None:
+        if not sync:
+            return None
+        if self.dry_run:
+            return self.device_identity
+        actual = self._crosspoint_for_run().get_status().device
+        if self.device_identity is not None and actual != self.device_identity:
+            raise DeviceIdentityMismatchError()
+        return actual
+
     @staticmethod
     def _new_entry(
         article: FetchedArticle,
@@ -613,7 +739,7 @@ class Orchestrator:
             "config_hash": config_hash,
             "filename": filename,
             "generated": False,
-            "uploaded": False,
+            "uploads": {},
         }
 
     def _generation_current(
@@ -643,7 +769,9 @@ class Orchestrator:
             return False
 
     @staticmethod
-    def _owned_remote_path(entry: Mapping[str, Any] | None) -> str | None:
+    def _owned_remote_path(
+        entry: Mapping[str, Any] | None, device_identity: str
+    ) -> str | None:
         """Return a validated remote path this entry proves it owns."""
 
         if not (
@@ -654,14 +782,20 @@ class Orchestrator:
         ):
             return None
         filename = entry["filename"]
-        owned_remote = entry.get("owned_remote_path")
+        uploads = entry.get("uploads")
+        if not isinstance(uploads, Mapping):
+            return None
+        state = uploads.get(device_identity)
+        if not isinstance(state, Mapping):
+            return None
+        owned_remote = state.get("owned_remote_path")
         if (
             _valid_remote_path(owned_remote)
             and owned_remote.rsplit("/", 1)[-1] == filename
         ):
             return owned_remote
-        if entry.get("uploaded") is True:
-            remote_path = entry.get("remote_path")
+        if state.get("uploaded") is True:
+            remote_path = state.get("remote_path")
             if (
                 _valid_remote_path(remote_path)
                 and remote_path.rsplit("/", 1)[-1] == filename
@@ -670,10 +804,41 @@ class Orchestrator:
         return None
 
     @staticmethod
-    def _owns_remote(entry: Mapping[str, Any] | None, expected_remote: str) -> bool:
+    def _owns_remote(
+        entry: Mapping[str, Any] | None,
+        device_identity: str,
+        expected_remote: str,
+    ) -> bool:
         """Return whether validated state proves ownership of one path."""
 
-        return Orchestrator._owned_remote_path(entry) == expected_remote
+        return (
+            Orchestrator._owned_remote_path(entry, device_identity)
+            == expected_remote
+        )
+
+    @staticmethod
+    def _invalidated_uploads(
+        entry: Mapping[str, Any] | None,
+    ) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        if not isinstance(entry, Mapping):
+            return result
+        uploads = entry.get("uploads")
+        if not isinstance(uploads, Mapping):
+            return result
+        for device_identity, raw_state in uploads.items():
+            if not isinstance(device_identity, str) or not isinstance(
+                raw_state, Mapping
+            ):
+                continue
+            pending: dict[str, Any] = {"uploaded": False}
+            owned_remote = raw_state.get("owned_remote_path")
+            if raw_state.get("uploaded") is True:
+                owned_remote = raw_state.get("remote_path")
+            if _valid_remote_path(owned_remote):
+                pending["owned_remote_path"] = owned_remote
+            result[device_identity] = pending
+        return result
 
     def _upload_current(
         self,
@@ -683,6 +848,7 @@ class Orchestrator:
         content_hash: str,
         config_hash: str,
         filename: str,
+        device_identity: str,
     ) -> bool:
         if not self._generation_current(
             entry,
@@ -693,9 +859,15 @@ class Orchestrator:
         ):
             return False
         expected_remote = _remote_path(self.remote_directory, filename)
+        uploads = entry.get("uploads")
+        if not isinstance(uploads, Mapping):
+            return False
+        state = uploads.get(device_identity)
+        if not isinstance(state, Mapping):
+            return False
         return (
-            entry.get("uploaded") is True
-            and entry.get("remote_path") == expected_remote
+            state.get("uploaded") is True
+            and state.get("remote_path") == expected_remote
         )
 
     @staticmethod
@@ -731,7 +903,19 @@ class Orchestrator:
             return self._run_locked(sync=sync)
 
     def _run_locked(self, *, sync: bool) -> WorkflowResult:
-        manifest = _Manifest(manifest_path(self.output_dir))
+        manifest = _Manifest(
+            manifest_path(self.output_dir),
+            legacy_device_identity=self.legacy_device_identity,
+        )
+        target_device_identity = self._target_device_identity(sync=sync)
+        if (
+            sync
+            and target_device_identity is not None
+            and manifest.has_unassigned_legacy
+        ):
+            raise LegacyManifestDeviceRequiredError()
+        if not self.dry_run and manifest.needs_save:
+            manifest.save()
         result = _MutableResult(
             command="sync" if sync else "export", dry_run=self.dry_run
         )
@@ -765,7 +949,11 @@ class Orchestrator:
                 filename = safe_epub_filename(article)
                 entry = manifest.articles.get(article_id)
                 expected_remote = _remote_path(self.remote_directory, filename)
-                prior_owned_path = self._owned_remote_path(entry)
+                prior_owned_path = (
+                    self._owned_remote_path(entry, target_device_identity)
+                    if target_device_identity is not None
+                    else None
+                )
                 prior_owned_remote = prior_owned_path == expected_remote
                 generation_current = self._generation_current(
                     entry,
@@ -774,12 +962,17 @@ class Orchestrator:
                     config_hash=config_hash,
                     filename=filename,
                 )
-                upload_current = sync and self._upload_current(
-                    entry,
-                    article=article,
-                    content_hash=content_hash,
-                    config_hash=config_hash,
-                    filename=filename,
+                upload_current = (
+                    sync
+                    and target_device_identity is not None
+                    and self._upload_current(
+                        entry,
+                        article=article,
+                        content_hash=content_hash,
+                        config_hash=config_hash,
+                        filename=filename,
+                        device_identity=target_device_identity,
+                    )
                 )
 
                 if self.dry_run:
@@ -803,8 +996,7 @@ class Orchestrator:
                     pending = self._new_entry(
                         article, content_hash, config_hash, filename
                     )
-                    if prior_owned_path is not None:
-                        pending["owned_remote_path"] = prior_owned_path
+                    pending["uploads"] = self._invalidated_uploads(entry)
                     manifest.articles[article_id] = pending
                     manifest.save()
                     generated_path = self._exporter_for_run().export_article(
@@ -813,13 +1005,16 @@ class Orchestrator:
                     if not isinstance(generated_path, (str, os.PathLike)):
                         raise WorkflowError()
                     generated_path = Path(generated_path)
-                    if generated_path.parent != self.output_dir or generated_path.name != filename:
+                    if (
+                        generated_path.parent != self.output_dir
+                        or generated_path.name != filename
+                    ):
                         raise WorkflowError()
                     output_hash = _file_hash(generated_path)
                     pending["output_hash"] = output_hash
                     pending["generated"] = True
-                    # ``_new_entry`` already cleared upload state; this is
-                    # intentional when --force regenerates an EPUB.
+                    # Regeneration invalidates completion for every reader;
+                    # each reader retains only its own proven remote ownership.
                     manifest.save()
                     result.generated += 1
                     entry = pending
@@ -828,12 +1023,15 @@ class Orchestrator:
                     entry = manifest.articles[article_id]
 
                 if sync:
+                    if target_device_identity is None:
+                        raise WorkflowInputError()
                     upload_current = self._upload_current(
                         entry,
                         article=article,
                         content_hash=content_hash,
                         config_hash=config_hash,
                         filename=filename,
+                        device_identity=target_device_identity,
                     )
                     needs_upload = self.force or not upload_current
                     if needs_upload:
@@ -841,11 +1039,13 @@ class Orchestrator:
                         # validated old path before clearing completion.  This
                         # lets a later retry replace that known path without
                         # authorizing an unrelated remote file.
-                        if entry.get("uploaded") is True:
+                        uploads = entry["uploads"]
+                        state = uploads.get(target_device_identity, {})
+                        if state.get("uploaded") is True:
+                            pending_state: dict[str, Any] = {"uploaded": False}
                             if prior_owned_path is not None:
-                                entry["owned_remote_path"] = prior_owned_path
-                            entry["uploaded"] = False
-                            entry.pop("remote_path", None)
+                                pending_state["owned_remote_path"] = prior_owned_path
+                            uploads[target_device_identity] = pending_state
                             manifest.save()
                         uploaded_path = self._crosspoint_for_run().upload_epub(
                             self.output_dir / filename,
@@ -854,9 +1054,10 @@ class Orchestrator:
                         )
                         if uploaded_path != expected_remote:
                             raise WorkflowError()
-                        entry["uploaded"] = True
-                        entry["remote_path"] = expected_remote
-                        entry.pop("owned_remote_path", None)
+                        uploads[target_device_identity] = {
+                            "uploaded": True,
+                            "remote_path": expected_remote,
+                        }
                         manifest.save()
                         result.uploaded += 1
                     else:
@@ -874,6 +1075,8 @@ class Orchestrator:
 __all__ = [
     "DEFAULT_OUTPUT_DIRECTORY",
     "MANIFEST_VERSION",
+    "DeviceIdentityMismatchError",
+    "LegacyManifestDeviceRequiredError",
     "ManifestError",
     "ManifestLockError",
     "Orchestrator",

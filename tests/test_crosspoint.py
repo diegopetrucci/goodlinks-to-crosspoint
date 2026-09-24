@@ -44,6 +44,9 @@ class CrossPointFixtureHandler(BaseHTTPRequestHandler):
     status_body: object = {"device": "X3"}
     directory_status = 200
     directory_entries: ClassVar[list[dict[str, object]]] = []
+    directory_entries_by_path: ClassVar[
+        dict[str, list[dict[str, object]]]
+    ] = {}
     upload_status = 200
     upload_body = b"File uploaded successfully: synthetic-book.epub"
     redirect_location: str | None = None
@@ -104,9 +107,15 @@ class CrossPointFixtureHandler(BaseHTTPRequestHandler):
                     "text/plain",
                 )
                 return
+            requested_path = urllib.parse.parse_qs(
+                parsed.query, keep_blank_values=True
+            ).get("path", ["/"])[0]
+            entries = self.__class__.directory_entries_by_path.get(
+                requested_path, self.__class__.directory_entries
+            )
             self._send(
                 200,
-                json.dumps(self.__class__.directory_entries).encode("utf-8"),
+                json.dumps(entries).encode("utf-8"),
                 "application/json",
             )
             return
@@ -148,6 +157,7 @@ class CrossPointFixture(TestCase):
         CrossPointFixtureHandler.status_body = {"device": "X3"}
         CrossPointFixtureHandler.directory_status = 200
         CrossPointFixtureHandler.directory_entries = []
+        CrossPointFixtureHandler.directory_entries_by_path = {}
         CrossPointFixtureHandler.upload_status = 200
         CrossPointFixtureHandler.upload_body = (
             b"File uploaded successfully: synthetic-book.epub"
@@ -171,7 +181,7 @@ class CrossPointFixture(TestCase):
 class CrossPointURLTests(TestCase):
     def test_default_url_and_restricted_url_parts(self) -> None:
         self.assertEqual(DEFAULT_CROSSPOINT_URL, "http://crosspoint.local")
-        self.assertEqual(DEFAULT_REMOTE_DIRECTORY, "/GoodLinks")
+        self.assertEqual(DEFAULT_REMOTE_DIRECTORY, "/")
         self.assertEqual(normalize_remote_path("/GoodLinks/"), "/GoodLinks")
         self.assertIs(package.normalize_remote_path, normalize_remote_path)
         self.assertIsInstance(CrossPointClient(), CrossPointClient)
@@ -247,6 +257,17 @@ class CrossPointHTTPTests(CrossPointFixture):
         self.assertFalse(hasattr(status, "mode"))
         self.assertFalse(hasattr(status, "ignored"))
 
+    def test_status_accepts_x4_pro_firmware_identity(self) -> None:
+        CrossPointFixtureHandler.status_body = {
+            "device": "xteink_x4_pro",
+            "version": "synthetic-version",
+        }
+
+        status = self.client().get_status()
+
+        self.assertIsInstance(status, CrossPointStatus)
+        self.assertEqual(status.device, "xteink_x4_pro")
+
     def test_wrong_device_status_is_rejected_without_echoing_body(self) -> None:
         CrossPointFixtureHandler.status_body = {
             "device": "synthetic-other-device",
@@ -280,34 +301,49 @@ class CrossPointHTTPTests(CrossPointFixture):
         request = CrossPointFixtureHandler.requests[0]
         self.assertEqual(request["method"], "GET")
         self.assertEqual(request["path"], "/api/files")
-        self.assertEqual(request["query"]["path"], ["/GoodLinks"])
+        self.assertEqual(request["query"]["path"], ["/"])
 
     def test_upload_creates_missing_default_directory_and_uses_multipart_http(
         self,
     ) -> None:
-        CrossPointFixtureHandler.directory_status = 404
+        CrossPointFixtureHandler.status_body = {"device": "xteink_x4_pro"}
+        # CrossPoint 1.6.0 reports a missing path as the same successful empty
+        # listing it uses for an existing empty directory.
+        CrossPointFixtureHandler.directory_entries_by_path = {
+            "/": [],
+            "/GoodLinks": [],
+        }
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "synthetic-book.epub"
             epub_bytes = b"synthetic EPUB bytes only for a local test"
             source.write_bytes(epub_bytes)
 
-            remote_path = self.client().upload_epub(source)
+            remote_path = self.client().upload_epub(
+                source, remote_directory="/GoodLinks"
+            )
 
         self.assertEqual(remote_path, "/GoodLinks/synthetic-book.epub")
         self.assertEqual(
             [request["method"] for request in CrossPointFixtureHandler.requests],
-            ["GET", "GET", "POST", "POST"],
+            ["GET", "GET", "POST", "GET", "POST"],
         )
         self.assertEqual(
             [request["path"] for request in CrossPointFixtureHandler.requests],
-            ["/api/status", "/api/files", "/mkdir", "/upload"],
+            ["/api/status", "/api/files", "/mkdir", "/api/files", "/upload"],
         )
         mkdir_request = CrossPointFixtureHandler.requests[2]
         mkdir_form = urllib.parse.parse_qs(
             bytes(mkdir_request["body"]).decode("utf-8"), keep_blank_values=True
         )
         self.assertEqual(mkdir_form, {"name": ["GoodLinks"], "path": ["/"]})
-        upload_request = CrossPointFixtureHandler.requests[3]
+        self.assertEqual(
+            CrossPointFixtureHandler.requests[1]["query"]["path"], ["/"]
+        )
+        self.assertEqual(
+            CrossPointFixtureHandler.requests[3]["query"]["path"],
+            ["/GoodLinks"],
+        )
+        upload_request = CrossPointFixtureHandler.requests[4]
         self.assertEqual(upload_request["query"]["path"], ["/GoodLinks"])
         headers = upload_request["headers"]
         self.assertEqual(
@@ -320,15 +356,39 @@ class CrossPointHTTPTests(CrossPointFixture):
         self.assertIn(b"synthetic EPUB bytes only for a local test", upload_body)
         self.assertNotIn("Authorization", headers)
 
+    def test_upload_to_root_does_not_create_a_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "synthetic-book.epub"
+            source.write_bytes(b"synthetic root EPUB")
+
+            remote_path = self.client().upload_epub(
+                source, remote_directory="/"
+            )
+
+        self.assertEqual(remote_path, "/synthetic-book.epub")
+        self.assertEqual(
+            [request["path"] for request in CrossPointFixtureHandler.requests],
+            ["/api/status", "/api/files", "/upload"],
+        )
+        self.assertNotIn(
+            "/mkdir",
+            [request["path"] for request in CrossPointFixtureHandler.requests],
+        )
+        self.assertEqual(
+            CrossPointFixtureHandler.requests[-1]["query"]["path"], ["/"]
+        )
+
     def test_existing_destination_name_is_refused_before_upload(self) -> None:
-        CrossPointFixtureHandler.directory_entries = [
-            {
-                "name": "synthetic-book.epub",
-                "size": 99,
-                "isDirectory": False,
-                "isEpub": True,
-            }
-        ]
+        CrossPointFixtureHandler.directory_entries_by_path = {
+            "/": [
+                {
+                    "name": "synthetic-book.epub",
+                    "size": 99,
+                    "isDirectory": False,
+                    "isEpub": True,
+                }
+            ],
+        }
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "synthetic-book.epub"
             source.write_bytes(b"synthetic local epub")
@@ -343,21 +403,23 @@ class CrossPointHTTPTests(CrossPointFixture):
         )
 
     def test_explicit_overwrite_boolean_allows_documented_upload(self) -> None:
-        CrossPointFixtureHandler.directory_entries = [
-            {
-                "name": "synthetic-book.epub",
-                "size": 99,
-                "isDirectory": False,
-                "isEpub": True,
-            }
-        ]
+        CrossPointFixtureHandler.directory_entries_by_path = {
+            "/": [
+                {
+                    "name": "synthetic-book.epub",
+                    "size": 99,
+                    "isDirectory": False,
+                    "isEpub": True,
+                }
+            ],
+        }
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "synthetic-book.epub"
             source.write_bytes(b"synthetic replacement epub")
 
             result = self.client().upload_epub(source, overwrite=True)
 
-        self.assertEqual(result, "/GoodLinks/synthetic-book.epub")
+        self.assertEqual(result, "/synthetic-book.epub")
         self.assertEqual(CrossPointFixtureHandler.requests[-1]["path"], "/upload")
 
     def test_upload_validates_documented_success_body_and_status(self) -> None:

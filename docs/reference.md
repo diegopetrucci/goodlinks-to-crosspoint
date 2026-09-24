@@ -57,15 +57,15 @@ behavioral prerequisites are:
   open with **Settings > API** enabled while running `export` or `sync`.
 - Pandoc available as a separate executable for a real `export` or `sync`.
   This project does not install Pandoc. `send` and dry-runs do not invoke it.
-- A CrossPoint device that reports `X3` or `X4` from its status endpoint. Put
-  it in wireless **File Transfer** mode before a real upload and leave that
-  mode active until the transfer is complete.
+- A CrossPoint device that reports `X3`, `X4`, or `xteink_x4_pro` from its
+  status endpoint. Put it in wireless **File Transfer** mode before a real
+  upload and leave that mode active until the transfer is complete.
 
 The device may join the same trusted private network as the Mac or provide a
 private temporary hotspot for the Mac. The CLI does not enter or leave device
 modes, discover devices, or verify the user's network choice. The default
 CrossPoint URL is `http://crosspoint.local` and the default remote directory is
-`/GoodLinks`.
+the reader root, `/`.
 
 ## Credentials: direct CLI versus wrapper
 
@@ -144,18 +144,25 @@ arguments:
 
 It forwards other supported `sync` flags, including `--api-url`,
 `--api-timeout`, `--pandoc-executable`, `--pandoc-timeout`,
-`--device-timeout`, `--dry-run`, `--force`, and `--destination`. Since the
-fixed flags are last, attempts to override the tag, output directory, or
-device URL lose to the wrapper's values. `sync` still does not accept
-`--overwrite`.
+`--device-timeout`, `--device-model`, `--legacy-device`, `--dry-run`,
+`--force`, and `--destination`. Since the fixed flags are last, attempts to
+override the tag, output directory, or device URL lose to the wrapper's
+values. `sync` still does not accept `--overwrite`.
 
 Typical wrapper invocations are:
 
 ```console
 ./sync.sh --dry-run
 ./sync.sh
+./sync.sh --legacy-device x3
+./sync.sh --dry-run --device-model x4pro
 ./sync.sh --force
 ```
+
+The `--legacy-device` example is a one-time migration command for a version-1
+manifest whose earlier uploads went to an X3. It assigns only the old upload
+state; it does not itself select the currently connected reader. Omit it once
+the manifest has been migrated.
 
 A wrapper dry-run still reads GoodLinks and requires the pass entry and token,
 but the Python workflow does not invoke Pandoc, write output or manifest state,
@@ -212,7 +219,7 @@ for a non-loopback host.
 - `EPUB` — one local EPUB path; this positional argument is required.
 - `--device-url URL` — CrossPoint base URL; default
   `http://crosspoint.local`.
-- `--destination PATH` — absolute CrossPoint directory; default `/GoodLinks`.
+- `--destination PATH` — absolute CrossPoint directory; default `/`.
 - `--device-timeout SECONDS` — CrossPoint request timeout; default `15.0`
   seconds.
 - `--overwrite` — explicitly allow replacing an existing remote basename. It
@@ -234,6 +241,13 @@ normalized away.
 - `--device-url URL` — same default and validation as `send`.
 - `--destination PATH` — same default and validation as `send`.
 - `--device-timeout SECONDS` — same default and validation as `send`.
+- `--device-model MODEL` — optional expected target model: `x3`, `x4`, or
+  `x4pro`. A real sync detects the connected model and rejects a mismatch. A
+  dry-run does not contact the device, so this option selects the model whose
+  existing upload state should be used for the plan.
+- `--legacy-device MODEL` — one-time owner of upload state imported from a
+  version-1 manifest: `x3`, `x4`, or `x4pro`. Use the reader that received the
+  earlier uploads, not necessarily the reader connected for this run.
 
 `sync` has no `--overwrite` option. Its `--force` flag is the explicit remote
 overwrite control.
@@ -308,8 +322,7 @@ EPUB archive itself. A synthetic command is:
 
 ```console
 .venv/bin/goodlinks-crosspoint send ./export/synthetic-article.epub \
-  --device-url http://crosspoint.local \
-  --destination /GoodLinks
+  --device-url http://crosspoint.local
 ```
 
 A matching remote basename is refused by default. Add `--overwrite` only when
@@ -318,15 +331,15 @@ replacing that known remote file is intentional:
 ```console
 .venv/bin/goodlinks-crosspoint send ./export/synthetic-article.epub \
   --device-url http://crosspoint.local \
-  --destination /GoodLinks \
   --overwrite
 ```
 
 The upload checks status before creating a missing destination or sending file
-bytes. A status response must identify an `X3` or `X4` device. The client uses
-the documented status, directory, directory-creation, and multipart-upload
-endpoints; it does not authenticate to CrossPoint, follow redirects, delete
-remote files, or change device mode.
+bytes. A status response must identify an `X3`, `X4`, or X4 Pro device (the X4
+Pro firmware reports `xteink_x4_pro`). The client uses the documented status,
+directory, directory-creation, and multipart-upload endpoints; it does not
+authenticate to CrossPoint, follow redirects, delete remote files, or change
+device mode.
 
 The CrossPoint v1.5.0 web uploader has a filename-comma problem. Generated
 basenames avoid commas, and `send` rejects one before any network request. Do
@@ -337,9 +350,14 @@ not bypass that validation with an unsafe filename.
 `sync` performs the `export` work and then uploads each generated EPUB to the
 configured CrossPoint directory. Its defaults are the `x3` GoodLinks tag,
 `export` output directory, `http://crosspoint.local` device URL,
-`/GoodLinks` destination, `pandoc` executable, and the timeouts listed above.
+root (`/`) destination, `pandoc` executable, and the timeouts listed above.
 A real sync requires both a valid GoodLinks token and an available CrossPoint
 File Transfer server.
+
+Older manifests may record completed X3 uploads under the former `/GoodLinks`
+default. The first sync after switching to the root destination uploads the
+currently selected EPUBs to root and records those new paths. It does not
+delete the older folder copies.
 
 For each selected article, the workflow:
 
@@ -348,10 +366,14 @@ For each selected article, the workflow:
 3. reuses a current local EPUB when its manifest entry and file hash match;
 4. generates a missing or changed EPUB with Pandoc; and
 5. uploads it when the manifest does not prove the expected remote path is
-   complete.
+   complete for the connected model.
 
-The GoodLinks client is read-only. CrossPoint is contacted only for an actual
-upload, and the CLI performs no background upload.
+The GoodLinks client is read-only. A real sync reads CrossPoint status once to
+identify the connected model, even when every upload can be skipped. It then
+contacts CrossPoint again only when an upload operation needs it, and performs
+no background upload. Each invocation targets one connected reader; running
+the command once with the X3 and once with the X4 Pro delivers the same current
+EPUB set to both without erasing either model's completion state.
 
 ### Dry-run behavior
 
@@ -365,8 +387,10 @@ A sync dry-run constructs and validates the configured CrossPoint client but
 never contacts the device. It can therefore validate a URL and timeout without
 the device being available. If an existing manifest or lock is present, the
 workflow may read or contend with that existing state; it does not mutate it.
-The wrapper has the additional `crosspoint.local` resolution step described
-above.
+Without `--device-model`, a dry-run cannot attribute an upload skip to a
+particular model and conservatively plans every selected upload. With
+`--device-model`, it uses only that model's completion state. The wrapper has
+the additional `crosspoint.local` resolution step described above.
 
 The result line reports `planned_generation` and `planned_upload` counts for
 work that would occur. It reports current generation or upload skips when
@@ -387,21 +411,24 @@ selected. The `pandoc-timeout`, API timeout, and device timeout control a run
 but are not conversion-content inputs in the manifest hash.
 
 - `export --force` regenerates every selected EPUB and clears its upload
-  completion in the manifest. It never uploads.
+  completion for every model in the manifest. Proven remote ownership remains
+  model-specific for a safe retry. It never uploads.
 - `sync --force` regenerates every selected EPUB and uploads it, explicitly
-  permitting replacement of the destination basename. Review the selected
-  queue and remote names first; this can replace a file not proven to belong to
-  this manifest.
+  permitting replacement of the destination basename on the connected model.
+  Review the selected queue and remote names first; this can replace a file not
+  proven to belong to this manifest.
 - `send --overwrite` is the separate one-file replacement permission.
 - `send` has no `--force`, and `sync` has no `--overwrite`.
 
 For a normal sync, an existing remote basename is refused unless the manifest
-proves that exact remote path was previously owned by this workflow. That
-ownership evidence also lets a changed article or failed retry replace the
-known path without `--force`. An unrelated same-named remote file remains
-protected. A completed manifest entry is trusted for an upload skip; the CLI
-does not re-list the device to prove that a previously uploaded file still
-exists. Use `--force` after reviewing the device if it was removed or changed.
+proves that exact remote path was previously owned by this workflow on the
+connected model. That ownership evidence also lets a changed article or failed
+retry replace the known path without `--force`. Ownership recorded for an X3
+never authorizes replacement on an X4 or X4 Pro. An unrelated same-named remote
+file remains protected. A completed per-model manifest entry is trusted for an
+upload skip; the CLI does not re-list the device to prove that a previously
+uploaded file still exists. Use `--force` after reviewing that reader if it was
+removed or changed.
 
 The manifest hashes the executable path and selected conversion configuration,
 not the installed Pandoc binary's version. After upgrading Pandoc in place,
@@ -418,13 +445,15 @@ run.
 
 - **Generated EPUBs:** `./export/*.epub`, one safe-named file per generated
   article. They are ignored and are not automatically deleted.
-- **Manifest:** `./export.manifest.json`, a version-1 JSON file containing
-  article IDs, hashes, safe filenames, generation/upload booleans, and
-  conditional remote paths. Workflow-created entries start with `id`,
-  `content_hash`, `config_hash`, `filename`, `generated`, and `uploaded`.
-  Successful generation adds `output_hash`; successful upload adds
-  `remote_path`; an incomplete retry may instead retain `owned_remote_path`.
-  A manifest generated by this workflow contains no article HTML or token, but
+- **Manifest:** `./export.manifest.json`, a version-2 JSON file containing
+  article IDs, hashes, safe filenames, generation state, and an `uploads`
+  mapping keyed by CrossPoint model identity (`X3`, `X4`, or
+  `xteink_x4_pro`). Successful generation adds `output_hash`. Each model's
+  successful upload state contains `uploaded` and `remote_path`; an incomplete
+  retry may instead retain `owned_remote_path`. The manifest stores no device
+  serial or other unique hardware identifier. Consequently, two physical
+  readers of the same model share one model-level completion record. A
+  manifest generated by this workflow contains no article HTML or token, but
   IDs, names, and remote paths can still be sensitive.
 - **Advisory lock:** `./export.manifest.lock`, a mode `0600` sibling lock file
   for a real `export` or `sync`. The lock is held for the complete run and the
@@ -434,8 +463,8 @@ run.
   metadata, CSS, and staging output are cleaned up after conversion is
   complete or fails; remove a leftover staging file only after no workflow is
   running.
-- **CrossPoint files:** remote
-  `/GoodLinks/<safe-basename>.epub` files deliberately sent to the device.
+- **CrossPoint files:** remote `/<safe-basename>.epub` files deliberately sent
+  to the device by default. A custom `--destination` changes this path.
   The CLI does not delete them, and `send` does not add them to the manifest.
 
 For `--output-dir ./work/epubs`, the sibling state files are
@@ -446,8 +475,12 @@ output path. Keep these paths out of reports and screenshots.
 A real run writes manifest files atomically with mode `0600`. The manifest is
 bounded to 4 MiB and is validated before use. Unknown article-entry fields,
 invalid hashes, unsafe names or paths, inconsistent completion flags, truncated
-JSON, and wrong versions are rejected as `manifest_error` rather than silently
-repaired. Unknown top-level fields are currently accepted. A real workflow
+JSON, and unsupported versions are rejected as `manifest_error` rather than
+silently repaired. Unknown top-level fields are currently accepted. A valid
+version-1 manifest is migrated to version 2, but any earlier upload or ownership
+state has no model identity. Before a real sync can continue, assign that state
+once with `--legacy-device`; the workflow otherwise fails with
+`legacy_manifest_device_required` without changing the file. A real workflow
 uses a nonblocking advisory lock and fails with `manifest_locked` if another
 workflow owns it. A dry-run does not create a missing lock file.
 
@@ -473,6 +506,10 @@ include:
 - `wrong_device`, `crosspoint_unavailable`, or
   `crosspoint_upload_incomplete` — keep the device in File Transfer mode and
   follow the recovery steps below.
+- `device_identity_mismatch` — the connected model differs from
+  `--device-model`; connect the intended reader or correct the expectation.
+- `legacy_manifest_device_required` — rerun once with `--legacy-device` set to
+  the reader that received uploads recorded by the version-1 manifest.
 - `remote_file_exists` — review the remote basename; use an explicit overwrite
   control only when replacement is intended.
 - `manifest_error` or `manifest_locked` — follow the local-state recovery
@@ -552,12 +589,12 @@ If a failure happened before any request bytes were sent, the client may report
 `crosspoint_unavailable` instead. Inspecting the destination before retrying is
 still the safe choice.
 
-## CrossPoint, X3, and firmware caveats
+## CrossPoint, Xteink devices, and firmware caveats
 
 The current client targets the documented CrossPoint status, directory,
 directory-creation, and multipart-upload HTTP endpoints. It supports status
-identities `X3` and `X4`; it does not implement USB transfer, Calibre transfer,
-firmware flashing, device unlocking, or remote deletion.
+identities `X3`, `X4`, and `xteink_x4_pro`; it does not implement USB transfer,
+Calibre transfer, firmware flashing, device unlocking, or remote deletion.
 
 For CrossPoint Reader v1.5.0, project guidance is to treat X3 USB/Calibre
 transfer as a corruption risk and use wireless File Transfer for this workflow
@@ -581,6 +618,8 @@ device revision.
 Consult the official sources before any device-changing operation:
 
 - [CrossPoint Reader repository and README](https://github.com/crosspoint-reader/crosspoint-reader)
+- [CrossPoint Reader 1.6.0 release](https://github.com/crosspoint-reader/crosspoint-reader/releases/tag/1.6.0)
+- [v1.6.0 web-server endpoints](https://github.com/crosspoint-reader/crosspoint-reader/blob/1.6.0/docs/webserver-endpoints.md)
 - [Official CrossPoint Xteink Unlocker](https://crosspointreader.com/#unlock-tool)
 - [Official CrossPoint web flash tools](https://crosspointreader.com/#flash-tools)
 - [CrossPoint Reader v1.5.0 release](https://github.com/crosspoint-reader/crosspoint-reader/releases/tag/v1.5.0)
@@ -622,9 +661,10 @@ based only on an assumed shell working directory.
    `./work/epubs.manifest.json` and `./work/epubs.manifest.lock`. Never remove
    a lock while a workflow is running.
 6. **CrossPoint:** while still on the trusted File Transfer connection, inspect
-   `/GoodLinks` and delete the EPUBs and partial uploads you sent in the
-   device UI. The CLI does not delete device files. Then exit File Transfer,
-   disable the temporary hotspot if used, and disconnect from that network.
+   the root directory (or the custom destination) and delete the EPUBs and
+   partial uploads you sent in the device UI. The CLI does not delete device
+   files. Then exit File Transfer, disable the temporary hotspot if used, and
+   disconnect from that network.
 7. **Pandoc:** if it was installed with Homebrew and is no longer wanted, run
    this manually after the workflow is stopped:
 

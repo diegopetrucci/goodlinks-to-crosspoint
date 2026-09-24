@@ -1,7 +1,7 @@
 """Explicit HTTP client for the documented CrossPoint file-transfer API.
 
-Endpoint reference (CrossPoint Reader v1.5.0):
-https://github.com/crosspoint-reader/crosspoint-reader/blob/v1.5.0/docs/webserver-endpoints.md
+Endpoint reference (CrossPoint Reader 1.6.0):
+https://github.com/crosspoint-reader/crosspoint-reader/blob/1.6.0/docs/webserver-endpoints.md
 
 The client deliberately uses only the HTTP status, directory listing/creation,
 and multipart upload endpoints.  The CrossPoint HTTP server is available while
@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any, BinaryIO
 
 DEFAULT_CROSSPOINT_URL = "http://crosspoint.local"
-DEFAULT_REMOTE_DIRECTORY = "/GoodLinks"
+DEFAULT_REMOTE_DIRECTORY = "/"
 DEFAULT_TIMEOUT = 15.0
 
 MAX_STATUS_RESPONSE_BYTES = 64 * 1024
@@ -38,7 +38,7 @@ MAX_FILENAME_BYTES = 255
 MAX_REMOTE_PATH_BYTES = 1_024
 MAX_TIMEOUT = 300.0
 
-_ALLOWED_DEVICES = frozenset({"X3", "X4"})
+SUPPORTED_DEVICE_IDENTITIES = frozenset({"X3", "X4", "xteink_x4_pro"})
 _CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 
 
@@ -135,7 +135,10 @@ class CrossPointRedirectError(CrossPointHTTPError):
 
 class WrongDeviceError(CrossPointResponseError):
     code = "wrong_device"
-    default_message = "The status endpoint is not an X3 or X4 CrossPoint device."
+    default_message = (
+        "The status endpoint is not a supported X3, X4, or X4 Pro "
+        "CrossPoint device."
+    )
 
 
 class CrossPointMalformedResponseError(CrossPointResponseError):
@@ -269,7 +272,7 @@ def _validate_status(payload: Any) -> CrossPointStatus:
         raise WrongDeviceError()
 
     device = payload.get("device")
-    if not isinstance(device, str) or device not in _ALLOWED_DEVICES:
+    if not isinstance(device, str) or device not in SUPPORTED_DEVICE_IDENTITIES:
         # Do not include an unknown value: it could be an arbitrary server
         # response and is not needed to explain the safe failure.
         raise WrongDeviceError()
@@ -631,19 +634,27 @@ class CrossPointClient:
         if remote_path == "/":
             return self._list_directory(remote_path)
 
-        entries: tuple[RemoteEntry, ...] = ()
-        current = ""
+        # CrossPoint 1.6.0 returns ``200 []`` both for an empty directory and
+        # for a path that does not exist.  Inspect each parent instead of using
+        # the target listing's status as an existence check.
+        parent = "/"
         for segment in remote_path.strip("/").split("/"):
-            current = f"{current}/{segment}"
-            try:
-                entries = self._list_directory(current)
-            except CrossPointHTTPError as error:
-                if error.status != 404:
-                    raise
-                parent = current.rsplit("/", 1)[0] or "/"
+            entries = self._list_directory(parent)
+            matching_directory = next(
+                (
+                    entry
+                    for entry in entries
+                    if entry.is_directory
+                    and entry.name.casefold() == segment.casefold()
+                ),
+                None,
+            )
+            if matching_directory is None:
                 self._create_directory(segment, parent)
-                entries = ()
-        return entries
+            parent = (
+                f"/{segment}" if parent == "/" else f"{parent}/{segment}"
+            )
+        return self._list_directory(remote_path)
 
     def ensure_directory(self, remote_path: str = DEFAULT_REMOTE_DIRECTORY) -> None:
         """Create the explicit destination path when CrossPoint reports it absent."""
@@ -778,6 +789,7 @@ __all__ = [
     "InvalidRemotePathError",
     "RemoteEntry",
     "RemoteFileExistsError",
+    "SUPPORTED_DEVICE_IDENTITIES",
     "UploadTooLargeError",
     "WrongDeviceError",
     "normalize_remote_path",
