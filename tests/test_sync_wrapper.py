@@ -145,6 +145,35 @@ class SyncWrapperFixture(unittest.TestCase):
         self.assertNotIn("synthetic-inherited-token", combined)
         self.assertNotIn(SYNTHETIC_ADDRESS, combined)
 
+    def test_local_env_token_without_pass(self) -> None:
+        (self.root / ".env").write_text("GOODLINKS_TOKEN=" + SYNTHETIC_TOKEN + "\n")
+        (self.bin / "pass").unlink()
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        invocation = json.loads(self.python_log.read_text())
+        self.assertEqual(invocation["token"], SYNTHETIC_TOKEN)
+        self.assertNotIn(SYNTHETIC_TOKEN, invocation["args"])
+        self.assert_no_private_diagnostic(result)
+
+    def test_local_env_is_never_executed(self) -> None:
+        marker = self.root / "executed"
+        token = "$(touch " + str(marker) + ")"
+        (self.root / ".env").write_text("GOODLINKS_TOKEN=" + token + "\n")
+        result = self.run_wrapper()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(marker.exists())
+        self.assertNotIn(token, result.stderr + result.stdout)
+        self.assertFalse(self.pass_log.exists())
+
+    def test_invalid_local_env_does_not_fall_back_to_pass(self) -> None:
+        for content in ("", "GOODLINKS_TOKEN=\n", "OTHER=value\n",
+                        "GOODLINKS_TOKEN=one\nGOODLINKS_TOKEN=two\n"):
+            with self.subTest(content=content):
+                (self.root / ".env").write_text(content)
+                result = self.run_wrapper()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.pass_log.exists())
+
     def test_zero_arguments_use_fixed_options_and_scoped_token(self) -> None:
         result = self.run_wrapper()
 

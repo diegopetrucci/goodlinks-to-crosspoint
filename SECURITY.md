@@ -36,7 +36,9 @@ filename; its URL, hostname, IP, device address, token, article text, and
 export content must all be synthetic.
 
 Do not put `GOODLINKS_TOKEN` values in command arguments, URLs, source files,
-`.env` files, shell startup files, or documentation. For a local manual test,
+shell startup files, or documentation. The explicitly supported local exception
+is the Git-ignored `.env` used by `sync.sh`, with permissions `600`; never commit
+or share it. For a local manual test,
 read it silently into the environment, run the command, and `unset
 GOODLINKS_TOKEN` immediately afterward. Never enable shell tracing while it is
 set.

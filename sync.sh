@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 
-# This wrapper deliberately does not source .sync.env.  The local file may
-# contain only the one non-secret setting parsed below; the token remains an
-# inline environment value for the Python child process.
+# Local environment files are parsed as data, never sourced as shell code.
+# The token is passed only to the Python child process.
 set +x
 set -euo pipefail
 
@@ -14,6 +13,7 @@ readonly ROOT_DIR
 readonly VENV_PYTHON="$ROOT_DIR/.venv/bin/python"
 readonly SOURCE_DIR="$ROOT_DIR/src"
 readonly SYNC_ENV="$ROOT_DIR/.sync.env"
+readonly TOKEN_ENV="$ROOT_DIR/.env"
 readonly PASS_ENTRY='goodlinks-crosspoint/goodlinks-token'
 readonly CROSSPOINT_HOST='crosspoint.local'
 
@@ -88,7 +88,7 @@ if [[ "$(uname -s 2>/dev/null || true)" != 'Darwin' ]]; then
     fail 'CrossPoint sync is supported on macOS only.'
 fi
 
-if ! PASS_BIN=$(command -v pass); then
+if [[ ! -e "$TOKEN_ENV" && ! -L "$TOKEN_ENV" ]] && ! PASS_BIN=$(command -v pass); then
     fail 'the pass executable is missing; install pass and create the documented token entry.'
 fi
 if ! DSCACHEUTIL_BIN=$(command -v dscacheutil); then
@@ -158,7 +158,31 @@ resolve_device
 
 run_sync() {
     local token
-    if ! token=$("$PASS_BIN" show "$PASS_ENTRY" 2>/dev/null); then
+    if [[ -e "$TOKEN_ENV" || -L "$TOKEN_ENV" ]]; then
+        if [[ -L "$TOKEN_ENV" || ! -f "$TOKEN_ENV" || ! -r "$TOKEN_ENV" ]]; then
+            fail '.env must be a readable regular file, not a symlink.'
+        fi
+        local line token_seen=0
+        token=''
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]]; then
+                continue
+            fi
+            case "$line" in
+                GOODLINKS_TOKEN=*)
+                    if (( token_seen )); then
+                        fail '.env contains duplicate GOODLINKS_TOKEN settings.'
+                    fi
+                    token=${line#GOODLINKS_TOKEN=}
+                    token_seen=1
+                    ;;
+                *) fail '.env supports only GOODLINKS_TOKEN.' ;;
+            esac
+        done < "$TOKEN_ENV"
+        if [[ -z "$token" || "$token" =~ [[:space:][:cntrl:]] ]]; then
+            fail '.env must contain one non-blank GOODLINKS_TOKEN without whitespace.'
+        fi
+    elif ! token=$("$PASS_BIN" show "$PASS_ENTRY" 2>/dev/null); then
         fail 'unable to read the GoodLinks token from pass entry goodlinks-crosspoint/goodlinks-token.'
     fi
     # A pass entry is expected to contain one token line.  Reject malformed

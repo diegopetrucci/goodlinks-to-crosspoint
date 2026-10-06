@@ -26,10 +26,11 @@ non-sensitive test values, fake Pandoc executables, and local synthetic HTTP
 servers. Tests must not contact a real GoodLinks app, CrossPoint device,
 external service, or personal network.
 
-Never add a token option, store a token in a URL/configuration file, or enable
+Never add a token option, store a token in a URL/committed configuration file, or enable
 shell tracing while `GOODLINKS_TOKEN` is set. Manual testing must read the token
 silently from a prompt, keep it ephemeral, and run `unset GOODLINKS_TOKEN` when
-done. Do not use real databases or exports to make a test more realistic.
+done. The user-managed, Git-ignored `.env` for `sync.sh` is supported for local
+use with permissions `600`, but tests must use synthetic tokens. Do not use real databases or exports to make a test more realistic.
 
 ## Development setup
 

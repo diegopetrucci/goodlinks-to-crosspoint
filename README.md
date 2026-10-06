@@ -28,16 +28,15 @@ see the [complete reference](docs/reference.md).
 - [Pandoc](https://pandoc.org) for EPUB generation; and
 - a supported reader running CrossPoint in wireless **File Transfer** mode.
 
-The repository's `sync.sh` convenience wrapper also requires
-[`pass`](https://www.passwordstore.org). The Python CLI can be used without
-`pass`.
+The `sync.sh` wrapper reads `GOODLINKS_TOKEN` from a local, Git-ignored `.env`.
+If `.env` is absent, it falls back to [`pass`](https://www.passwordstore.org).
 
 ## Setup
 
-1. Install Pandoc and `pass`:
+1. Install Pandoc:
 
    ```console
-   brew install pandoc pass
+   brew install pandoc
    ```
 
 2. Clone the project and install it into a local virtual environment:
@@ -56,8 +55,13 @@ The repository's `sync.sh` convenience wrapper also requires
 4. Store that token for the wrapper:
 
    ```console
-   pass insert goodlinks-crosspoint/goodlinks-token
+   touch .env
+   chmod 600 .env
    ```
+
+   Edit `.env` and add `GOODLINKS_TOKEN=your-token` with the actual token.
+   Use an unquoted value; the file is parsed as data, never executed.
+   Keep this file local and never commit or share it.
 
 5. Create the ignored local configuration and choose the GoodLinks tag to
    sync:
